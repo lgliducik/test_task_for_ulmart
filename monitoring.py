@@ -12,6 +12,7 @@ import argparse
 import json
 import traceback
 import settings
+from sqlalchemy.sql import exists
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename=settings.PATH_TO_LOG_FILE, level=logging.DEBUG)
@@ -35,6 +36,9 @@ class Monitoring(Base):
         self.url = url
         self.label = label
         self.response_time = response_time
+
+    def __repr__(self):
+        return "<Monitoring('%s','%s', '%s')>" % (self.url, self.label, str(self.status_code))
 
 
 def create_table():
@@ -80,8 +84,15 @@ def main():
         data_monitoring = Monitoring(url=url,
                                      label=label,
                                      response_time=time.time())
-        session.add(data_monitoring)
-        session.commit()
+        query_set = session.query(Monitoring)
+        data_line = query_set.filter_by(url=url).first()
+        
+        if session.query(exists().where(Monitoring.url == url)).scalar():
+            logger.info('data with this %s is exist', url)
+        else:
+            session.add(data_monitoring)
+            logger.info('write monitoring data to table %s', data_monitoring)
+            session.commit()
 
     with requests.Session() as requests_session:
         for monitoring_data in monitoring_datas:
@@ -105,6 +116,7 @@ def main():
                 if data_line.status_code == 200:
                     data_line.content_lenght = len(res._content)
                 session.add(data_line)
+                logger.info('change status code for data %s', data_line)
                 session.commit()
 
 
