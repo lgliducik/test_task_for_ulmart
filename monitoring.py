@@ -4,15 +4,17 @@ import datetime
 import time
 import logging
 import sys
-from sqlalchemy import create_engine, MetaData
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Table, Column, Integer, String, DateTime, Float
-from sqlalchemy.orm import sessionmaker
 import argparse
 import json
 import traceback
 import settings
+import concurrent.futures
+
 from sqlalchemy.sql import exists
+from sqlalchemy import create_engine, MetaData
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Table, Column, Integer, String, DateTime, Float
+from sqlalchemy.orm import sessionmaker
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(filename=settings.PATH_TO_LOG_FILE, level=logging.DEBUG)
@@ -20,6 +22,7 @@ logging.basicConfig(filename=settings.PATH_TO_LOG_FILE, level=logging.DEBUG)
 
 Base = declarative_base()
 metadata = MetaData()
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.COUNT_THREAD)
 
 
 class Monitoring(Base):
@@ -38,7 +41,8 @@ class Monitoring(Base):
         self.response_time = response_time
 
     def __repr__(self):
-        return "<Monitoring('%s','%s', '%s')>" % (self.url, self.label, str(self.status_code))
+        print_data = self.url, self.label, str(self.status_code)
+        return "<Monitoring('%s','%s', '%s')>" % (print_data)
 
 
 def create_table():
@@ -58,9 +62,34 @@ def createParser():
     return parser
 
 
-def add_data_to_json_file(error_dict):
+def add_data_to_json_file(data, exc_type, exc_value, exc_traceback):
+    error = {"timestamp": str(data.ts),
+             "url": data.url,
+             "error": {"exception_type": str(exc_type),
+                       "exception_value": str(exc_value),
+                       "stack": str(traceback.format_stack())}}
     with open(settings.PATH_TO_DUMP_FILE, 'w+') as outfile:
-        json.dump(error_dict, outfile)
+        json.dump(error, outfile)
+
+
+def save_monitoring_data_from_exel(sheet, session):
+    monitoring_datas = []
+    for num in range(sheet.nrows)[1:]:
+        url, label, fetch = [i.value for i in sheet.row(num)]
+        monitoring_datas.append([url, label, fetch])
+        data_monitoring = Monitoring(url=url,
+                                     label=label,
+                                     response_time=time.time())
+        query_set = session.query(Monitoring)
+        data_line = query_set.filter_by(url=url).first()
+
+        if session.query(exists().where(Monitoring.url == url)).scalar():
+            logger.info('data with this %s is exist', url)
+        else:
+            session.add(data_monitoring)
+            logger.info('write monitoring data to table %s', data_monitoring)
+            session.commit()
+    return monitoring_datas
 
 
 def main():
@@ -71,53 +100,31 @@ def main():
     session = create_table()
 
     book = open_workbook(payload['path_to_excel_file'], on_demand=True)
-    sheet = book.sheet_by_name('test')
+    for name in book.sheet_names():
+        logger.info('starting search data from bookname %s', name)
+        sheet = book.sheet_by_name(name)
 
-    monitoring_datas = []
+        monitoring_datas = save_monitoring_data_from_exel(sheet, session)
 
-
-    for num in range(sheet.nrows)[1:]:
-        url = sheet.row(num)[0].value
-        label = sheet.row(num)[1].value
-
-        monitoring_datas.append([i.value for i in sheet.row(num)])
-        data_monitoring = Monitoring(url=url,
-                                     label=label,
-                                     response_time=time.time())
-        query_set = session.query(Monitoring)
-        data_line = query_set.filter_by(url=url).first()
-        
-        if session.query(exists().where(Monitoring.url == url)).scalar():
-            logger.info('data with this %s is exist', url)
-        else:
-            session.add(data_monitoring)
-            logger.info('write monitoring data to table %s', data_monitoring)
-            session.commit()
-
-    with requests.Session() as requests_session:
-        for monitoring_data in monitoring_datas:
-            fetch = monitoring_data[2]
-            if bool(fetch) is True:
-                url = monitoring_data[0]
-                query_set = session.query(Monitoring)
-                data_line = query_set.filter_by(url=url).first()
-                try:
-                    res = requests_session.get(url)
-                except Exception:
-                    exc_type, exc_value, exc_traceback = sys.exc_info()
-                    error = {"timestamp": str(data_line.ts),
-                             "url": data_line.url,
-                             "error": {"exception_type": str(exc_type),
-                                       "exception_value": str(exc_value),
-                                       "stack": str(traceback.format_stack())}}
-                    add_data_to_json_file(error)
-
-                data_line.status_code = res.status_code
-                if data_line.status_code == 200:
-                    data_line.content_lenght = len(res._content)
-                session.add(data_line)
-                logger.info('change status code for data %s', data_line)
-                session.commit()
+        with requests.Session() as requests_session:
+            for monitoring_data in monitoring_datas:
+                url, label, fetch = monitoring_data
+                if bool(fetch) is True:
+                    query_set = session.query(Monitoring)
+                    data_line = query_set.filter_by(url=url).first()
+                    try:
+                        # res = requests_session.get(url, timeout=settings.TIMEOUT)
+                        future = executor.submit(requests_session.get, url, timeout=settings.TIMEOUT)
+                        res = future.result()
+                    except Exception:
+                        add_data_to_json_file(data_line, *sys.exc_info())
+                    else:
+                        data_line.status_code = res.status_code
+                        if data_line.status_code == 200:
+                            data_line.content_lenght = len(res._content)
+                        session.add(data_line)
+                        logger.info('change status code for data %s', data_line)
+                        session.commit()
 
 
 if __name__ == '__main__':
