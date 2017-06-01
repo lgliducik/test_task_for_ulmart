@@ -8,7 +8,8 @@ import argparse
 import json
 import traceback
 import settings
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
+import os
 
 from sqlalchemy.sql import exists
 from sqlalchemy import create_engine, MetaData
@@ -22,7 +23,7 @@ logging.basicConfig(filename=settings.PATH_TO_LOG_FILE, level=logging.DEBUG)
 
 Base = declarative_base()
 metadata = MetaData()
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.COUNT_THREAD)
+executor = ThreadPoolExecutor(max_workers=settings.COUNT_THREAD)
 
 
 class Monitoring(Base):
@@ -34,11 +35,6 @@ class Monitoring(Base):
     response_time = Column(Float)
     status_code = Column(Integer, default=None)
     content_lenght = Column(Integer, default=None)
-
-    def __init__(self, url, label, response_time):
-        self.url = url
-        self.label = label
-        self.response_time = response_time
 
     def __repr__(self):
         print_data = self.url, self.label, str(self.status_code)
@@ -77,25 +73,23 @@ def save_monitoring_data_from_exel(sheet, session):
     for num in range(sheet.nrows)[1:]:
         url, label, fetch = [i.value for i in sheet.row(num)]
         monitoring_datas.append([url, label, fetch])
-        data_monitoring = Monitoring(url=url,
-                                     label=label,
-                                     response_time=time.time())
-        query_set = session.query(Monitoring)
-        data_line = query_set.filter_by(url=url).first()
-
-        if session.query(exists().where(Monitoring.url == url)).scalar():
-            logger.info('data with this %s is exist', url)
-        else:
-            session.add(data_monitoring)
-            logger.info('write monitoring data to table %s', data_monitoring)
-            session.commit()
     return monitoring_datas
+
+
+def update_fields(data, content_lenght, status_code):
+    data.response_time = time.time()
+    data.content_lenght = content_lenght
+    data.status_code = status_code
+    return data
 
 
 def main():
     parser = createParser()
     namespace = parser.parse_args()
     payload = {'path_to_excel_file': namespace.path}
+
+    if settings.DROP_ALL_DB:
+        os.remove(settings.PATH_TO_DB_FILE)
 
     session = create_table()
 
@@ -109,21 +103,33 @@ def main():
         with requests.Session() as requests_session:
             for monitoring_data in monitoring_datas:
                 url, label, fetch = monitoring_data
+
                 if bool(fetch) is True:
-                    query_set = session.query(Monitoring)
-                    data_line = query_set.filter_by(url=url).first()
+                    data_monitoring = Monitoring(url=url,
+                                                 label=label)
                     try:
-                        # res = requests_session.get(url, timeout=settings.TIMEOUT)
                         future = executor.submit(requests_session.get, url, timeout=settings.TIMEOUT)
                         res = future.result()
                     except Exception:
-                        add_data_to_json_file(data_line, *sys.exc_info())
+                        add_data_to_json_file(data_monitoring, *sys.exc_info())
                     else:
-                        data_line.status_code = res.status_code
-                        if data_line.status_code == 200:
-                            data_line.content_lenght = len(res._content)
-                        session.add(data_line)
-                        logger.info('change status code for data %s', data_line)
+                        status_code = res.status_code
+                        if status_code == 200:
+                            content_lenght = len(res._content)
+
+                        data_monitoring = update_fields(data_monitoring,
+                                                        content_lenght,
+                                                        status_code)
+
+                        if session.query(exists().where(Monitoring.url == url)).scalar():
+                            logger.info('data with this %s is exist', url)
+                            query_set = session.query(Monitoring)
+                            data_line = query_set.filter_by(url=url).first()
+                            data_line = update_fields(data_line, content_lenght, status_code)
+                            session.add(data_line)
+                        else:
+                            session.add(data_monitoring)
+                            logger.info('write monitoring data to table %s', data_monitoring)
                         session.commit()
 
 
